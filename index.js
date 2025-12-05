@@ -1,10 +1,8 @@
-// index.js
+// index.js (fixed)
 import 'dotenv/config';
 import express from 'express';
-import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionsBitField } from 'discord.js';
 import { initDb, ensureTables } from './db.js';
-import pkg from 'pg';
-const { Pool } = pkg;
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -25,6 +23,7 @@ if (!DATABASE_URL) {
   console.error('Missing DATABASE_URL in environment variables.');
   process.exit(1);
 }
+
 const pool = initDb(DATABASE_URL);
 
 (async () => {
@@ -81,8 +80,8 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
   }
 })();
 
-// --- Updated ready event for Discord.js v15+
-client.once('clientReady', () => {
+// --- Correct ready event
+client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
@@ -131,96 +130,110 @@ async function countRaritySince(guildId, sinceTs) {
 
 // --- Interaction handler
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
+  try {
+    if (!interaction.isChatInputCommand()) return;
 
-  const guildId = interaction.guildId;
-  if (!guildId) {
-    await interaction.reply({ content: 'This command must be used in a server.', ephemeral: true });
-    return;
-  }
-
-  if (interaction.commandName === 'setup') {
-    // admin only: safe check for permissions
-    const hasAdmin = interaction.memberPermissions?.has?.('Administrator');
-    if (!hasAdmin) {
-      await interaction.reply({ content: 'You must be an Administrator to run /setup', ephemeral: true });
+    const guildId = interaction.guildId;
+    if (!guildId) {
+      await interaction.reply({ content: 'This command must be used in a server.', ephemeral: true });
       return;
     }
-    const channel = interaction.options.getChannel('log_channel', true);
-    const tz = interaction.options.getString('timezone') ?? DEFAULT_TZ;
-    const loss = interaction.options.getNumber('loss_multiplier') ?? DEFAULT_LOSS;
 
-    await saveSettings(guildId, channel.id, tz, loss);
-    await interaction.reply({ content: `Saved settings:\nLog channel: <#${channel.id}>\nTimezone: ${tz}\nLoss multiplier: x${loss}`, ephemeral: false });
-    return;
-  }
+    if (interaction.commandName === 'setup') {
+      // admin only: robust permission check
+      const member = interaction.member;
+      const hasAdmin = member && member.permissions && member.permissions.has && member.permissions.has(PermissionsBitField.Flags.Administrator);
+      if (!hasAdmin) {
+        await interaction.reply({ content: 'You must be an Administrator to run /setup', ephemeral: true });
+        return;
+      }
 
-  if (interaction.commandName === 'dailycount') {
-    await interaction.deferReply(); // might take a moment
-    const settings = await getSettings(guildId);
-    const tz = settings.timezone_offset || DEFAULT_TZ;
-    const match = tz.match(/UTC([+-]\d{1,2})/i);
-    let offsetHours = 0;
-    if (match) offsetHours = parseInt(match[1], 10);
+      const channel = interaction.options.getChannel('log_channel', true);
+      const tz = interaction.options.getString('timezone') ?? DEFAULT_TZ;
+      const loss = interaction.options.getNumber('loss_multiplier') ?? DEFAULT_LOSS;
 
-    const now = new Date();
-    const localMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0,0,0));
-    localMidnight.setUTCHours(localMidnight.getUTCHours() - offsetHours);
-    const sinceTs = localMidnight.toISOString();
+      await saveSettings(guildId, channel.id, tz, loss);
+      await interaction.reply({ content: `Saved settings:\nLog channel: <#${channel.id}>\nTimezone: ${tz}\nLoss multiplier: x${loss}`, ephemeral: false });
+      return;
+    }
 
-    const total = await countSince(guildId, sinceTs);
-    const perEgg = await countPerEggSince(guildId, sinceTs);
-    const rarity = await countRaritySince(guildId, sinceTs);
-
-    let msg = `EGG TRACKER — DAILY TRACK\n\nTotal Eggs Hatched: ${total}\n\nEggs:\n`;
-    if (perEgg.length === 0) msg += '- None -\n';
-    else perEgg.forEach(r => { msg += `- ${r.egg_name}: ${r.cnt}\n`; });
-
-    msg += `\nSpecial:\nSemi-Huge: ${rarity.semi_huge || 0}\nHuge: ${rarity.huge || 0}\nSemi-Titan: ${rarity.semi_titan || 0}\nTitan: ${rarity.titan || 0}\nGodly: ${rarity.godly || 0}\n`;
-
-    await interaction.editReply(msg);
-    return;
-  }
-
-  if (interaction.commandName === 'egg') {
-    await interaction.deferReply();
-    const eggType = interaction.options.getString('egg_type', true);
-    const period = interaction.options.getString('period', true);
-
-    const now = new Date();
-    let since = new Date();
-    if (period === 'today') {
-      const settings = await getSettings(interaction.guildId);
+    if (interaction.commandName === 'dailycount') {
+      await interaction.deferReply(); // might take a moment
+      const settings = await getSettings(guildId);
       const tz = settings.timezone_offset || DEFAULT_TZ;
       const match = tz.match(/UTC([+-]\d{1,2})/i);
       let offsetHours = 0;
-      if (match) offsetHours = parseInt(match[1],10);
+      if (match) offsetHours = parseInt(match[1], 10);
+
+      const now = new Date();
       const localMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0,0,0));
       localMidnight.setUTCHours(localMidnight.getUTCHours() - offsetHours);
-      since = localMidnight;
-    } else if (period.endsWith('d')) {
-      const days = parseInt(period.replace('d',''),10) || 1;
-      since.setDate(now.getDate() - days);
-    } else if (period === '24h') {
-      since.setHours(now.getHours() - 24);
-    } else {
-      since.setHours(now.getHours() - 24);
+      const sinceTs = localMidnight.toISOString();
+
+      const total = await countSince(guildId, sinceTs);
+      const perEgg = await countPerEggSince(guildId, sinceTs);
+      const rarity = await countRaritySince(guildId, sinceTs);
+
+      let msg = `EGG TRACKER — DAILY TRACK\n\nTotal Eggs Hatched: ${total}\n\nEggs:\n`;
+      if (perEgg.length === 0) msg += '- None -\n';
+      else perEgg.forEach(r => { msg += `- ${r.egg_name}: ${r.cnt}\n`; });
+
+      msg += `\nSpecial:\nSemi-Huge: ${rarity.semi_huge || 0}\nHuge: ${rarity.huge || 0}\nSemi-Titan: ${rarity.semi_titan || 0}\nTitan: ${rarity.titan || 0}\nGodly: ${rarity.godly || 0}\n`;
+
+      await interaction.editReply(msg);
+      return;
     }
 
-    const sinceTs = since.toISOString();
+    if (interaction.commandName === 'egg') {
+      await interaction.deferReply();
+      const eggType = interaction.options.getString('egg_type', true);
+      const period = interaction.options.getString('period', true);
 
-    if (eggType.toLowerCase() === 'all') {
-      const perEgg = await countPerEggSince(interaction.guildId, sinceTs);
-      let reply = `Egg counts since ${sinceTs}:\n`;
-      if (perEgg.length === 0) reply += '- None -\n';
-      else perEgg.forEach(r => reply += `- ${r.egg_name}: ${r.cnt}\n`);
-      await interaction.editReply(reply);
-    } else {
-      const res = await pool.query('SELECT COUNT(*) FROM hatch_logs WHERE guild_id=$1 AND egg_name=$2 AND hatched_at >= $3', [interaction.guildId, eggType, sinceTs]);
-      const cnt = parseInt(res.rows[0].count,10);
-      await interaction.editReply(`${eggType} hatched in the period: ${cnt}`);
+      const now = new Date();
+      let since = new Date();
+      if (period === 'today') {
+        const settings = await getSettings(interaction.guildId);
+        const tz = settings.timezone_offset || DEFAULT_TZ;
+        const match = tz.match(/UTC([+-]\d{1,2})/i);
+        let offsetHours = 0;
+        if (match) offsetHours = parseInt(match[1],10);
+        const localMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0,0,0));
+        localMidnight.setUTCHours(localMidnight.getUTCHours() - offsetHours);
+        since = localMidnight;
+      } else if (period.endsWith('d')) {
+        const days = parseInt(period.replace('d',''),10) || 1;
+        since.setDate(now.getDate() - days);
+      } else if (period === '24h') {
+        since.setHours(now.getHours() - 24);
+      } else {
+        since.setHours(now.getHours() - 24);
+      }
+
+      const sinceTs = since.toISOString();
+
+      if (eggType.toLowerCase() === 'all') {
+        const perEgg = await countPerEggSince(interaction.guildId, sinceTs);
+        let reply = `Egg counts since ${sinceTs}:\n`;
+        if (perEgg.length === 0) reply += '- None -\n';
+        else perEgg.forEach(r => reply += `- ${r.egg_name}: ${r.cnt}\n`);
+        await interaction.editReply(reply);
+      } else {
+        const res = await pool.query('SELECT COUNT(*) FROM hatch_logs WHERE guild_id=$1 AND egg_name=$2 AND hatched_at >= $3', [interaction.guildId, eggType, sinceTs]);
+        const cnt = parseInt(res.rows[0].count,10);
+        await interaction.editReply(`${eggType} hatched in the period: ${cnt}`);
+      }
+      return;
     }
-    return;
+  } catch (err) {
+    console.error('Interaction handler error', err);
+    // if interaction deferred, try to inform user; otherwise ignore
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply('An error occurred while processing the command.');
+      } else {
+        await interaction.reply({ content: 'An error occurred while processing the command.', ephemeral: true });
+      }
+    } catch (_) {}
   }
 });
 
