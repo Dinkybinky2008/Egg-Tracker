@@ -1,4 +1,3 @@
-// index.js (fixed)
 import 'dotenv/config';
 import express from 'express';
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionsBitField } from 'discord.js';
