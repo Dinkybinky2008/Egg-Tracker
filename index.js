@@ -21,8 +21,20 @@ if (!DISCORD_TOKEN || !CLIENT_ID || !GUILD_ID) {
 
 // --- DB init
 const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.error('Missing DATABASE_URL in environment variables.');
+  process.exit(1);
+}
 const pool = initDb(DATABASE_URL);
-await ensureTables();
+
+(async () => {
+  try {
+    await ensureTables();
+  } catch (err) {
+    console.error('Error initializing database tables:', err);
+    process.exit(1);
+  }
+})();
 
 // --- Helper: classify rarity from kg
 function classifyRarity(kg) {
@@ -35,7 +47,9 @@ function classifyRarity(kg) {
 }
 
 // --- Discord client
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+});
 
 // --- Slash commands to register
 const commands = [
@@ -67,7 +81,8 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
   }
 })();
 
-client.once('ready', () => {
+// --- Updated ready event for Discord.js v15+
+client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
@@ -125,8 +140,9 @@ client.on('interactionCreate', async interaction => {
   }
 
   if (interaction.commandName === 'setup') {
-    // admin only
-    if (!interaction.memberPermissions?.has('Administrator')) {
+    // admin only: safe check for permissions
+    const hasAdmin = interaction.memberPermissions?.has?.('Administrator');
+    if (!hasAdmin) {
       await interaction.reply({ content: 'You must be an Administrator to run /setup', ephemeral: true });
       return;
     }
@@ -142,17 +158,14 @@ client.on('interactionCreate', async interaction => {
   if (interaction.commandName === 'dailycount') {
     await interaction.deferReply(); // might take a moment
     const settings = await getSettings(guildId);
-    // compute local midnight using timezone offset
-    // for simplicity we treat timezone like "UTC+8" -> offset hours
     const tz = settings.timezone_offset || DEFAULT_TZ;
     const match = tz.match(/UTC([+-]\d{1,2})/i);
     let offsetHours = 0;
     if (match) offsetHours = parseInt(match[1], 10);
 
     const now = new Date();
-    // compute UTC midnight + offset
     const localMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0,0,0));
-    localMidnight.setUTCHours(localMidnight.getUTCHours() - offsetHours); // convert to UTC timestamp for DB query
+    localMidnight.setUTCHours(localMidnight.getUTCHours() - offsetHours);
     const sinceTs = localMidnight.toISOString();
 
     const total = await countSince(guildId, sinceTs);
@@ -174,11 +187,9 @@ client.on('interactionCreate', async interaction => {
     const eggType = interaction.options.getString('egg_type', true);
     const period = interaction.options.getString('period', true);
 
-    // compute since timestamp
     const now = new Date();
     let since = new Date();
     if (period === 'today') {
-      // use server settings tz
       const settings = await getSettings(interaction.guildId);
       const tz = settings.timezone_offset || DEFAULT_TZ;
       const match = tz.match(/UTC([+-]\d{1,2})/i);
@@ -193,7 +204,6 @@ client.on('interactionCreate', async interaction => {
     } else if (period === '24h') {
       since.setHours(now.getHours() - 24);
     } else {
-      // default last 24h
       since.setHours(now.getHours() - 24);
     }
 
@@ -214,22 +224,16 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// --- Webhook endpoint (POST /webhook)
-// Expect the game webhook to post an embed or JSON with egg name & weight.
-// We try to parse both message content and embed fields.
+// --- Webhook endpoint
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 function parseWebhookPayload(body) {
-  // This tries common embed shapes; adapt as needed.
-  // Example embed used earlier: fields contain "Hatched From" and "Weight".
   let eggName = null;
   let weight = 0;
 
-  // Try embed first
   if (body.embeds && body.embeds.length > 0) {
     const e = body.embeds[0];
-    // title may be pet name, fields may have Hatched From and Weight
     if (e.fields && e.fields.length) {
       for (const f of e.fields) {
         const name = (f.name||'').toLowerCase();
@@ -246,20 +250,17 @@ function parseWebhookPayload(body) {
     if (!eggName && e.title) eggName = e.title;
   }
 
-  // fallback to text body
   if (!eggName && body.content) {
     const m = body.content.match(/Hatched From\s*[:\-]\s*(.+)/i);
     if (m) eggName = m[1].replace(/egg/ig,'').trim();
   }
 
-  // fallback weight search anywhere
   if (!weight && JSON.stringify(body).match(/([0-9]+(\.[0-9]+)?)\s*kg/i)) {
     const m = JSON.stringify(body).match(/([0-9]+(\.[0-9]+)?)\s*kg/i);
     weight = parseFloat(m[1]);
   }
 
   if (!eggName) eggName = 'Unknown';
-
   return { eggName, weight };
 }
 
@@ -269,10 +270,8 @@ app.post('/webhook', async (req, res) => {
     const { eggName, weight } = parseWebhookPayload(payload);
     const rarity = classifyRarity(weight);
 
-    // We need a guild mapping for the webhook channel. We'll look up settings by channel.
-    const channelId = payload?.channel_id || (payload?.webhook_id ? (payload?.channel_id || null) : null) || WEBHOOK_CHANNEL_ID;
+    const channelId = payload?.channel_id || WEBHOOK_CHANNEL_ID;
 
-    // Find which guild uses this channel
     const sres = await pool.query('SELECT guild_id, loss_multiplier FROM settings WHERE webhook_channel_id = $1', [channelId]);
     let guildId;
     let lossMultiplier = DEFAULT_LOSS;
@@ -280,19 +279,14 @@ app.post('/webhook', async (req, res) => {
       guildId = sres.rows[0].guild_id;
       lossMultiplier = parseFloat(sres.rows[0].loss_multiplier || DEFAULT_LOSS);
     } else {
-      // fallback: first guild in settings table
       const fall = await pool.query('SELECT guild_id, webhook_channel_id FROM settings LIMIT 1');
-      if (fall.rowCount > 0) {
-        guildId = fall.rows[0].guild_id;
-      }
+      if (fall.rowCount > 0) guildId = fall.rows[0].guild_id;
     }
 
     if (!guildId) {
       console.log('Webhook received but no guild mapping found for channel', channelId);
-      // we still record under guild_id = 'unknown'
       await insertLog('unknown', eggName, weight, rarity);
     } else {
-      // Insert one log
       await insertLog(guildId, eggName, weight, rarity);
     }
 
